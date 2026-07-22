@@ -9,6 +9,8 @@
 #include <string>
 #include <fstream>
 #include <sstream>
+#include <thread>
+#include <atomic>
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "comdlg32.lib")
@@ -20,6 +22,9 @@ HWND g_hButton = NULL;
 HWND g_hButtonSave = NULL;
 HWND g_hButtonSaveUTF8 = NULL;
 HWND g_hButtonSaveANSI = NULL;
+HWND g_hButtonAdd = NULL;
+HWND g_hButtonDelete = NULL;
+HWND g_hButtonUndo = NULL;
 HWND g_hEdit = NULL;
 HWND g_hProgressDialog = NULL;
 HWND g_hProgressBar = NULL;
@@ -28,13 +33,24 @@ std::vector<std::vector<std::string>> g_csvData;
 std::vector<std::vector<bool>> g_wasQuoted; // Track which cells were originally quoted
 std::string g_currentFilePath;
 bool g_isModified = false;
-bool g_cancelLoad = false;
+std::atomic<bool> g_cancelLoad(false);
+std::atomic<bool> g_isLoading(false);
 bool g_isWindows874 = false; // Track if file was originally Windows-874
 int g_editingRow = -1;
 int g_editingCol = -1;
-std::string g_originalCellValue; // Store original value for ESC to restore
 char g_separator = ','; // Default separator (auto-detected)
-WNDPROC g_oldEditProc = NULL; // Original edit control window procedure
+std::wstring g_threadStatusText;
+std::atomic<int> g_threadProgressPercent(0);
+std::atomic<int> g_threadProgressMax(100);
+CRITICAL_SECTION g_dataCS; // Protect g_csvData during worker/UI thread interaction
+
+// Undo history structure
+struct UndoSnapshot {
+    std::vector<std::vector<std::string>> csvData;
+    std::vector<std::vector<bool>> wasQuoted;
+    bool isModified;
+};
+std::vector<UndoSnapshot> g_undoHistory;
 
 // Menu IDs
 #define IDM_OPEN 1001
@@ -45,6 +61,12 @@ WNDPROC g_oldEditProc = NULL; // Original edit control window procedure
 #define ID_BUTTON_SAVE 2002
 #define ID_BUTTON_SAVE_UTF8 2003
 #define ID_BUTTON_SAVE_ANSI 2004
+#define ID_BUTTON_ADD 2005
+#define ID_BUTTON_DELETE 2006
+#define ID_BUTTON_UNDO 2007
+#define IDM_ADD_ROW 1005
+#define IDM_DELETE_ROW 1006
+#define IDM_UNDO 1007
 #define ID_EDIT_CELL 3001
 #define ID_PROGRESS_BAR 4001
 #define ID_PROGRESS_TEXT 4002
@@ -56,7 +78,6 @@ LRESULT CALLBACK ProgressDialogProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
 void CreateListView(HWND hwndParent);
 void CreateButton(HWND hwndParent);
 void CreateProgressDialog();
-void UpdateProgress(int current, int total, const char* status);
 void CloseProgressDialog();
 void LoadCSVFile(const char* filename);
 void PopulateListView();
@@ -65,7 +86,13 @@ void SaveCSVFile();
 void SaveCSVFileAs(bool saveAsUTF8);
 void StartEditCell(int row, int col);
 void EndEditCell(bool save);
+void AddRow();
+void DeleteRow();
+void SaveUndoSnapshot();
+void UndoAction();
+bool IsColumnOrTableQuoted(size_t col, int excludeRow = -1);
 void UpdateWindowTitle();
+void UpdateUIState();
 void ShowAboutDialog();
 HMENU CreateMenuBar();
 char DetectSeparator(const std::string& line);
@@ -81,6 +108,9 @@ std::string WideToUTF8(const std::wstring& wide);
 
 // Entry point
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    // Initialize Critical Section
+    InitializeCriticalSection(&g_dataCS);
+
     // Initialize common controls
     INITCOMMONCONTROLSEX icex;
     icex.dwSize = sizeof(INITCOMMONCONTROLSEX);
@@ -117,6 +147,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     );
 
     if (g_hMainWindow == NULL) {
+        DeleteCriticalSection(&g_dataCS);
         return 0;
     }
 
@@ -130,6 +161,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         DispatchMessage(&msg);
     }
 
+    DeleteCriticalSection(&g_dataCS);
     return 0;
 }
 
@@ -147,14 +179,22 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
             // Resize buttons to stay at top
             if (g_hButton) {
-                MoveWindow(g_hButton, 10, 10, 120, 30, TRUE);
+                MoveWindow(g_hButton, 10, 10, 100, 30, TRUE);
             }
             if (g_hButtonSaveUTF8) {
-                MoveWindow(g_hButtonSaveUTF8, 140, 10, 130, 30, TRUE);
+                MoveWindow(g_hButtonSaveUTF8, 120, 10, 115, 30, TRUE);
             }
-
             if (g_hButtonSaveANSI) {
-                MoveWindow(g_hButtonSaveANSI, 280, 10, 130, 30, TRUE);
+                MoveWindow(g_hButtonSaveANSI, 245, 10, 110, 30, TRUE);
+            }
+            if (g_hButtonAdd) {
+                MoveWindow(g_hButtonAdd, 365, 10, 85, 30, TRUE);
+            }
+            if (g_hButtonDelete) {
+                MoveWindow(g_hButtonDelete, 460, 10, 95, 30, TRUE);
+            }
+            if (g_hButtonUndo) {
+                MoveWindow(g_hButtonUndo, 565, 10, 80, 30, TRUE);
             }
 
             // Resize ListView to fill remaining space
@@ -181,6 +221,17 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 EndEditCell(true); // Save any pending edit first!
                 SaveCSVFileAs(false); // Save as Windows-874 (ANSI)
                 return 0;
+            } else if (LOWORD(wParam) == IDM_ADD_ROW || LOWORD(wParam) == ID_BUTTON_ADD) {
+                EndEditCell(true); // Save any pending edit first!
+                AddRow();
+                return 0;
+            } else if (LOWORD(wParam) == IDM_DELETE_ROW || LOWORD(wParam) == ID_BUTTON_DELETE) {
+                EndEditCell(false); // Cancel any pending edit first!
+                DeleteRow();
+                return 0;
+            } else if (LOWORD(wParam) == IDM_UNDO || LOWORD(wParam) == ID_BUTTON_UNDO) {
+                UndoAction();
+                return 0;
             } else if (LOWORD(wParam) == IDM_ABOUT) {
                 ShowAboutDialog();
                 return 0;
@@ -193,12 +244,46 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
         case WM_NOTIFY: {
             LPNMHDR pnmhdr = (LPNMHDR)lParam;
-            if (pnmhdr->hwndFrom == g_hListView && pnmhdr->code == NM_CLICK) {
-                LPNMITEMACTIVATE pnmia = (LPNMITEMACTIVATE)lParam;
-                if (pnmia->iItem >= 0 && pnmia->iSubItem >= 0) {
-                    StartEditCell(pnmia->iItem, pnmia->iSubItem);
+            if (pnmhdr->hwndFrom == g_hListView) {
+                if (pnmhdr->code == NM_CLICK) {
+                    if (g_isLoading) return 0;
+                    LPNMITEMACTIVATE pnmia = (LPNMITEMACTIVATE)lParam;
+                    if (pnmia->iItem >= 0 && pnmia->iSubItem >= 0) {
+                        StartEditCell(pnmia->iItem, pnmia->iSubItem);
+                    }
+                    return 0;
+                } else if (pnmhdr->code == LVN_GETDISPINFOW) {
+                    NMLVDISPINFOW* plvdi = (NMLVDISPINFOW*)lParam;
+                    if (plvdi->item.mask & LVIF_TEXT) {
+                        int row = plvdi->item.iItem;
+                        int col = plvdi->item.iSubItem;
+
+                        EnterCriticalSection(&g_dataCS);
+                        if (row >= 0 && row < (int)g_csvData.size() - 1) {
+                            if (col == 0) {
+                                // Row number (1-based index for visual display, row 0 is header)
+                                static wchar_t rowNum[16];
+                                swprintf(rowNum, 16, L"%d", row + 1);
+                                plvdi->item.pszText = rowNum;
+                            } else {
+                                int dataCol = col - 1;
+                                int dataRow = row + 1; // row 0 is header, so row 0 in list is data row 1
+                                if (dataRow < (int)g_csvData.size() && dataCol >= 0 && dataCol < (int)g_csvData[dataRow].size()) {
+                                    // Cache wide string conversion for display
+                                    static std::wstring wideText;
+                                    wideText = UTF8ToWide(g_csvData[dataRow][dataCol]);
+                                    plvdi->item.pszText = (LPWSTR)wideText.c_str();
+                                } else {
+                                    plvdi->item.pszText = (LPWSTR)L"";
+                                }
+                            }
+                        } else {
+                            plvdi->item.pszText = (LPWSTR)L"";
+                        }
+                        LeaveCriticalSection(&g_dataCS);
+                    }
+                    return 0;
                 }
-                return 0;
             }
             break;
         }
@@ -214,6 +299,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 OpenFileDialog();
             } else if (wParam == 'S' && (GetKeyState(VK_CONTROL) & 0x8000)) {
                 SaveCSVFile();
+            } else if (wParam == 'N' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                EndEditCell(true);
+                AddRow();
+            } else if (wParam == 'Z' && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                UndoAction();
+            } else if (wParam == VK_DELETE && !g_hEdit) {
+                DeleteRow();
             } else if (wParam == VK_RETURN && g_hEdit) {
                 EndEditCell(true); // Save on Enter
             }
@@ -223,7 +315,61 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             OpenFileDialog();
             return 0;
 
+        case WM_TIMER:
+            if (wParam == 1) {
+                // Update progress dialog with thread-safe variables
+                if (g_hProgressDialog) {
+                    std::wstring statusStr = g_threadStatusText;
+                    // Convert status to ANSI/UTF-8 for static text window
+                    std::string status = WideToUTF8(statusStr);
+                    
+                    if (g_hProgressText) {
+                        SetWindowText(g_hProgressText, status.c_str());
+                    }
+
+                    if (g_hProgressBar) {
+                        SendMessage(g_hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, (int)g_threadProgressMax));
+                        SendMessage(g_hProgressBar, PBM_SETPOS, (int)g_threadProgressPercent, 0);
+                    }
+                }
+            }
+            return 0;
+
+        case WM_USER + 100: // Failure
+            KillTimer(hwnd, 1);
+            CloseProgressDialog();
+            UpdateUIState();
+            MessageBox(hwnd, "Failed to open file!", "Error", MB_OK | MB_ICONERROR);
+            return 0;
+
+        case WM_USER + 101: // Cancelled
+            KillTimer(hwnd, 1);
+            CloseProgressDialog();
+            UpdateUIState();
+            MessageBox(hwnd, "File loading cancelled!", "Cancelled", MB_OK | MB_ICONINFORMATION);
+            return 0;
+
+        case WM_USER + 102: // Empty
+            KillTimer(hwnd, 1);
+            CloseProgressDialog();
+            UpdateUIState();
+            MessageBox(hwnd, "CSV file is empty!", "Warning", MB_OK | MB_ICONWARNING);
+            return 0;
+
+        case WM_USER + 103: // Success
+            KillTimer(hwnd, 1);
+            CloseProgressDialog();
+            
+            // Update UI buttons state
+            UpdateUIState();
+            
+            // Update ListView and Window Title
+            PopulateListView();
+            UpdateWindowTitle();
+            return 0;
+
         case WM_DESTROY:
+            KillTimer(hwnd, 1);
             PostQuitMessage(0);
             return 0;
     }
@@ -242,11 +388,19 @@ HMENU CreateMenuBar() {
     AppendMenu(hFileMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hFileMenu, MF_STRING, IDM_EXIT, "E&xit");
 
+    // Edit menu
+    HMENU hEditMenu = CreateMenu();
+    AppendMenu(hEditMenu, MF_STRING, IDM_UNDO, "&Undo\tCtrl+Z");
+    AppendMenu(hEditMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hEditMenu, MF_STRING, IDM_ADD_ROW, "&Add Row\tCtrl+N");
+    AppendMenu(hEditMenu, MF_STRING, IDM_DELETE_ROW, "&Delete Row\tDel");
+
     // Help menu
     AppendMenu(hHelpMenu, MF_STRING, IDM_ABOUT, "&About CSV Editor...");
 
     // Add menus to menu bar
     AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hFileMenu, "&File");
+    AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hEditMenu, "&Edit");
     AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hHelpMenu, "&Help");
 
     return hMenuBar;
@@ -264,7 +418,7 @@ void CreateButton(HWND hwndParent) {
         "BUTTON",
         "Open CSV",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        10, 10, 120, 30,
+        10, 10, 100, 30,
         hwndParent,
         (HMENU)ID_BUTTON_OPEN,
         GetModuleHandle(NULL),
@@ -272,15 +426,13 @@ void CreateButton(HWND hwndParent) {
     );
     SendMessage(g_hButton, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    // Save button (removed - replaced with UTF-8 and ANSI buttons)
-
     // Save as UTF-8 button
     g_hButtonSaveUTF8 = CreateWindowEx(
         0,
         "BUTTON",
         "Save as UTF-8",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        140, 10, 130, 30,
+        120, 10, 115, 30,
         hwndParent,
         (HMENU)ID_BUTTON_SAVE_UTF8,
         GetModuleHandle(NULL),
@@ -294,7 +446,7 @@ void CreateButton(HWND hwndParent) {
         "BUTTON",
         "Save as ANSI",
         WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-        280, 10, 130, 30,
+        245, 10, 110, 30,
         hwndParent,
         (HMENU)ID_BUTTON_SAVE_ANSI,
         GetModuleHandle(NULL),
@@ -302,7 +454,52 @@ void CreateButton(HWND hwndParent) {
     );
     SendMessage(g_hButtonSaveANSI, WM_SETFONT, (WPARAM)hFont, TRUE);
 
+    // Add Row button
+    g_hButtonAdd = CreateWindowEx(
+        0,
+        "BUTTON",
+        "Add Row",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        365, 10, 85, 30,
+        hwndParent,
+        (HMENU)ID_BUTTON_ADD,
+        GetModuleHandle(NULL),
+        NULL
+    );
+    SendMessage(g_hButtonAdd, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Delete Row button
+    g_hButtonDelete = CreateWindowEx(
+        0,
+        "BUTTON",
+        "Delete Row",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        460, 10, 95, 30,
+        hwndParent,
+        (HMENU)ID_BUTTON_DELETE,
+        GetModuleHandle(NULL),
+        NULL
+    );
+    SendMessage(g_hButtonDelete, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+    // Undo button
+    g_hButtonUndo = CreateWindowEx(
+        0,
+        "BUTTON",
+        "Undo",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        565, 10, 80, 30,
+        hwndParent,
+        (HMENU)ID_BUTTON_UNDO,
+        GetModuleHandle(NULL),
+        NULL
+    );
+    SendMessage(g_hButtonUndo, WM_SETFONT, (WPARAM)hFont, TRUE);
+
     g_hButtonSave = g_hButtonSaveUTF8; // Keep reference for enabling/disabling
+
+    // Set initial button states (disabled until file is loaded)
+    UpdateUIState();
 }
 
 // Create ListView control
@@ -311,7 +508,7 @@ void CreateListView(HWND hwndParent) {
         WS_EX_CLIENTEDGE,
         WC_LISTVIEWW,
         L"",
-        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_VSCROLL | WS_HSCROLL | LVS_EDITLABELS,
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | WS_VSCROLL | WS_HSCROLL | LVS_EDITLABELS | LVS_OWNERDATA,
         0, 50, 0, 0,
         hwndParent,
         NULL,
@@ -451,28 +648,7 @@ void CreateProgressDialog() {
     UpdateWindow(g_hProgressDialog);
 }
 
-// Update progress
-void UpdateProgress(int current, int total, const char* status) {
-    if (!g_hProgressDialog) return;
 
-    // Update text
-    if (g_hProgressText) {
-        SetWindowText(g_hProgressText, status);
-    }
-
-    // Update progress bar
-    if (g_hProgressBar) {
-        SendMessage(g_hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, total));
-        SendMessage(g_hProgressBar, PBM_SETPOS, current, 0);
-    }
-
-    // Process messages to keep UI responsive
-    MSG msg;
-    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-}
 
 // Close progress dialog
 void CloseProgressDialog() {
@@ -846,17 +1022,27 @@ std::vector<std::string> ParseCSVLine(const std::string& line, char separator, s
     return result;
 }
 
-// Load CSV file
-void LoadCSVFile(const char* filename) {
-    g_csvData.clear();
-    g_wasQuoted.clear();
+// Struct to hold file loading parameters
+struct LoadThreadParams {
+    std::string filename;
+};
+
+// Thread worker function for loading CSV
+void LoadCSVThreadWorker(LoadThreadParams params) {
+    g_isLoading = true;
     g_cancelLoad = false;
+    g_threadProgressPercent = 0;
+    g_threadProgressMax = 100;
+    g_threadStatusText = L"Reading file...";
+
+    std::string filename = params.filename;
 
     // First, read file as binary to detect encoding
     std::ifstream file(filename, std::ios::binary);
 
     if (!file.is_open()) {
-        MessageBox(g_hMainWindow, "Failed to open file!", "Error", MB_OK | MB_ICONERROR);
+        g_isLoading = false;
+        PostMessage(g_hMainWindow, WM_USER + 100, 0, 0); // Notify failure
         return;
     }
 
@@ -866,11 +1052,6 @@ void LoadCSVFile(const char* filename) {
     file.seekg(0, std::ios::beg);
 
     bool showProgress = fileSize > (100 * 1024); // Show progress for files > 100KB
-
-    if (showProgress) {
-        CreateProgressDialog();
-        UpdateProgress(0, 100, "Reading file...");
-    }
 
     // Read first 1000 bytes to detect encoding
     char detectBuffer[1000];
@@ -884,18 +1065,12 @@ void LoadCSVFile(const char* filename) {
     // Store the original encoding for saving later
     g_isWindows874 = isWindows874;
 
-    // Debug: Show detected encoding
-    char encodingMsg[256];
-    sprintf(encodingMsg, "Detected encoding: %s", isWindows874 ? "Windows-874 (ANSI)" : "UTF-8");
-    if (showProgress) {
-        UpdateProgress(0, 100, encodingMsg);
-    } else {
-        // Show message box for small files
-        MessageBox(g_hMainWindow, encodingMsg, "Encoding Detection", MB_OK | MB_ICONINFORMATION);
-    }
+    wchar_t encMsg[256];
+    swprintf(encMsg, 256, L"Detected encoding: %s", isWindows874 ? L"Windows-874 (ANSI)" : L"UTF-8");
+    g_threadStatusText = encMsg;
 
-    if (showProgress && isWindows874) {
-        UpdateProgress(0, 100, "Converting from Windows-874 to UTF-8...");
+    if (isWindows874) {
+        g_threadStatusText = L"Converting from Windows-874 to UTF-8...";
     }
 
     std::vector<std::string> allLines;
@@ -908,8 +1083,8 @@ void LoadCSVFile(const char* filename) {
     while (std::getline(file, line)) {
         if (g_cancelLoad) {
             file.close();
-            CloseProgressDialog();
-            MessageBox(g_hMainWindow, "File loading cancelled!", "Cancelled", MB_OK | MB_ICONINFORMATION);
+            g_isLoading = false;
+            PostMessage(g_hMainWindow, WM_USER + 101, 0, 0); // Notify cancel
             return;
         }
 
@@ -938,9 +1113,11 @@ void LoadCSVFile(const char* filename) {
             bytesRead = file.tellg();
             int percent = (int)((bytesRead * 100) / fileSize);
             if (percent != lastPercent) {
-                char status[128];
-                sprintf(status, "Reading file... %d%%", percent);
-                UpdateProgress(percent, 100, status);
+                wchar_t status[128];
+                swprintf(status, 128, L"Reading file... %d%%", percent);
+                g_threadStatusText = status;
+                g_threadProgressPercent = percent;
+                g_threadProgressMax = 100;
                 lastPercent = percent;
             }
         }
@@ -949,53 +1126,79 @@ void LoadCSVFile(const char* filename) {
     file.close();
 
     if (allLines.empty()) {
-        CloseProgressDialog();
-        MessageBox(g_hMainWindow, "CSV file is empty!", "Warning", MB_OK | MB_ICONWARNING);
+        g_isLoading = false;
+        PostMessage(g_hMainWindow, WM_USER + 102, 0, 0); // Notify empty
         return;
     }
 
     // Detect separator from first line
-    if (showProgress) {
-        UpdateProgress(0, 100, "Detecting separator...");
-    }
+    g_threadStatusText = L"Detecting separator...";
     g_separator = DetectSeparator(allLines[0]);
 
     // Parse all lines with detected separator
-    if (showProgress) {
-        UpdateProgress(0, (int)allLines.size(), "Parsing rows...");
-    }
+    g_threadStatusText = L"Parsing rows...";
+    g_threadProgressPercent = 0;
+    g_threadProgressMax = (int)allLines.size();
+
+    // Prepare container data to swap in safely
+    std::vector<std::vector<std::string>> localCsvData;
+    std::vector<std::vector<bool>> localWasQuoted;
+    localCsvData.reserve(allLines.size());
+    localWasQuoted.reserve(allLines.size());
 
     for (size_t i = 0; i < allLines.size(); i++) {
         if (g_cancelLoad) {
-            CloseProgressDialog();
-            MessageBox(g_hMainWindow, "File loading cancelled!", "Cancelled", MB_OK | MB_ICONINFORMATION);
+            g_isLoading = false;
+            PostMessage(g_hMainWindow, WM_USER + 101, 0, 0); // Notify cancel
             return;
         }
 
         std::vector<bool> rowQuoted;
-        g_csvData.push_back(ParseCSVLine(allLines[i], g_separator, rowQuoted));
-        g_wasQuoted.push_back(rowQuoted);
+        localCsvData.push_back(ParseCSVLine(allLines[i], g_separator, rowQuoted));
+        localWasQuoted.push_back(rowQuoted);
 
-        // Update progress every 100 rows
-        if (showProgress && (i % 100 == 0 || i == allLines.size() - 1)) {
-            char status[128];
-            sprintf(status, "Parsing rows... %zu/%zu", i + 1, allLines.size());
-            UpdateProgress((int)(i + 1), (int)allLines.size(), status);
+        // Update progress every 500 rows to avoid overhead
+        if (i % 500 == 0 || i == allLines.size() - 1) {
+            wchar_t status[128];
+            swprintf(status, 128, L"Parsing rows... %zu/%zu", i + 1, allLines.size());
+            g_threadStatusText = status;
+            g_threadProgressPercent = (int)(i + 1);
         }
     }
 
-    // Populate the list view
-    if (showProgress) {
-        UpdateProgress(0, 100, "Populating table...");
-    }
+    g_threadStatusText = L"Populating table...";
+    g_threadProgressPercent = 0;
+    g_threadProgressMax = 100;
 
+    // Critical section swap data safely
+    EnterCriticalSection(&g_dataCS);
+    g_csvData.swap(localCsvData);
+    g_wasQuoted.swap(localWasQuoted);
+    g_undoHistory.clear();
     g_currentFilePath = filename;
     g_isModified = false;
-    EnableWindow(g_hButtonSave, TRUE);
-    PopulateListView();
-    UpdateWindowTitle();
+    LeaveCriticalSection(&g_dataCS);
 
-    CloseProgressDialog();
+    g_isLoading = false;
+    PostMessage(g_hMainWindow, WM_USER + 103, 0, 0); // Notify completion
+}
+
+// Launches background thread
+void LoadCSVFile(const char* filename) {
+    if (g_isLoading) return;
+
+    // Start loading thread
+    LoadThreadParams params;
+    params.filename = filename;
+
+    // Show progress dialog if filename size or loading suggests it's good (always setup timer)
+    CreateProgressDialog();
+
+    std::thread worker(LoadCSVThreadWorker, params);
+    worker.detach();
+
+    // Set a timer to update UI from global thread status variables
+    SetTimer(g_hMainWindow, 1, 100, NULL);
 }
 
 // Populate ListView with CSV data
@@ -1032,31 +1235,11 @@ void PopulateListView() {
         SendMessageW(g_hListView, LVM_INSERTCOLUMNW, i + 1, (LPARAM)&lvc);
     }
 
-    // Add data rows (skip first row as it's the header)
-    for (size_t row = 1; row < g_csvData.size(); row++) {
-        LVITEMW lvi = {};
-        lvi.mask = LVIF_TEXT;
-        lvi.iItem = row - 1;
-        lvi.iSubItem = 0;
-
-        // Row number in first column
-        wchar_t rowNum[16];
-        swprintf(rowNum, 16, L"%zu", row);
-        lvi.pszText = rowNum;
-        SendMessageW(g_hListView, LVM_INSERTITEMW, 0, (LPARAM)&lvi);
-
-        // Add actual data columns (offset by 1) using Unicode
-        if (!g_csvData[row].empty()) {
-            for (size_t col = 0; col < g_csvData[row].size() && col < colCount; col++) {
-                // Convert UTF-8 to wide string for proper Thai display
-                std::wstring wideText = UTF8ToWide(g_csvData[row][col]);
-
-                LVITEMW lviSub = {};
-                lviSub.iSubItem = col + 1;
-                lviSub.pszText = (LPWSTR)wideText.c_str();
-                SendMessageW(g_hListView, LVM_SETITEMTEXTW, row - 1, (LPARAM)&lviSub);
-            }
-        }
+    // Add data rows (Virtual ListView uses SetItemCount instead of loops)
+    if (g_csvData.size() > 1) {
+        ListView_SetItemCount(g_hListView, g_csvData.size() - 1);
+    } else {
+        ListView_SetItemCount(g_hListView, 0);
     }
 
     UpdateWindowTitle();
@@ -1121,7 +1304,9 @@ void SaveCSVFile() {
         return;
     }
 
+    EnterCriticalSection(&g_dataCS);
     if (g_csvData.empty()) {
+        LeaveCriticalSection(&g_dataCS);
         MessageBox(g_hMainWindow, "No data to save!", "Error", MB_OK | MB_ICONERROR);
         return;
     }
@@ -1129,6 +1314,7 @@ void SaveCSVFile() {
     std::ofstream file(g_currentFilePath, std::ios::binary);
 
     if (!file.is_open()) {
+        LeaveCriticalSection(&g_dataCS);
         char msg[512];
         sprintf(msg, "Failed to save file:\n%s", g_currentFilePath.c_str());
         MessageBox(g_hMainWindow, msg, "Error", MB_OK | MB_ICONERROR);
@@ -1160,6 +1346,9 @@ void SaveCSVFile() {
         file << "\r\n"; // Windows line ending
     }
 
+    size_t dataSize = g_csvData.size();
+    LeaveCriticalSection(&g_dataCS);
+
     file.close();
 
     // Verify the file was written
@@ -1175,7 +1364,7 @@ void SaveCSVFile() {
     char msg[512];
     const char* encoding = g_isWindows874 ? "Windows-874" : "UTF-8";
     sprintf(msg, "Successfully saved %zu rows to:\n%s\n\nEncoding: %s",
-            g_csvData.size(), g_currentFilePath.c_str(), encoding);
+            dataSize, g_currentFilePath.c_str(), encoding);
     MessageBox(g_hMainWindow, msg, "Success", MB_OK | MB_ICONINFORMATION);
 }
 
@@ -1186,7 +1375,9 @@ void SaveCSVFileAs(bool saveAsUTF8) {
         return;
     }
 
+    EnterCriticalSection(&g_dataCS);
     if (g_csvData.empty()) {
+        LeaveCriticalSection(&g_dataCS);
         MessageBox(g_hMainWindow, "No data to save!", "Error", MB_OK | MB_ICONERROR);
         return;
     }
@@ -1194,6 +1385,7 @@ void SaveCSVFileAs(bool saveAsUTF8) {
     std::ofstream file(g_currentFilePath, std::ios::binary);
 
     if (!file.is_open()) {
+        LeaveCriticalSection(&g_dataCS);
         char msg[512];
         sprintf(msg, "Failed to save file:\n%s", g_currentFilePath.c_str());
         MessageBox(g_hMainWindow, msg, "Error", MB_OK | MB_ICONERROR);
@@ -1227,6 +1419,9 @@ void SaveCSVFileAs(bool saveAsUTF8) {
         file << "\r\n"; // Windows line ending
     }
 
+    size_t dataSize = g_csvData.size();
+    LeaveCriticalSection(&g_dataCS);
+
     file.close();
 
     // Verify the file was written
@@ -1245,13 +1440,15 @@ void SaveCSVFileAs(bool saveAsUTF8) {
     char msg[512];
     const char* encoding = saveAsUTF8 ? "UTF-8" : "Windows-874 (ANSI)";
     sprintf(msg, "Successfully saved %zu rows to:\n%s\n\nEncoding: %s",
-            g_csvData.size(), g_currentFilePath.c_str(), encoding);
+            dataSize, g_currentFilePath.c_str(), encoding);
     MessageBox(g_hMainWindow, msg, "Success", MB_OK | MB_ICONINFORMATION);
 }
 
 // Update window title
 void UpdateWindowTitle() {
+    EnterCriticalSection(&g_dataCS);
     if (g_csvData.empty()) {
+        LeaveCriticalSection(&g_dataCS);
         SetWindowText(g_hMainWindow, "CSV Editor");
         return;
     }
@@ -1271,6 +1468,7 @@ void UpdateWindowTitle() {
             g_csvData.size() - 1,
             g_csvData.empty() ? 0 : g_csvData[0].size(),
             sepName);
+    LeaveCriticalSection(&g_dataCS);
 
     SetWindowText(g_hMainWindow, title);
 }
@@ -1286,35 +1484,33 @@ void ShowAboutDialog() {
                MB_OK | MB_ICONINFORMATION);
 }
 
-// Subclass window procedure for edit control to handle ESC and ENTER keys
-LRESULT CALLBACK EditSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
-    if (uMsg == WM_KEYDOWN) {
-        if (wParam == VK_RETURN) {
-            EndEditCell(true); // Save on Enter
-            return 0;
-        } else if (wParam == VK_ESCAPE) {
-            EndEditCell(false); // Discard on ESC
-            return 0;
-        }
-    }
-
-    // Call original window procedure for all other messages
-    return CallWindowProcW(g_oldEditProc, hwnd, uMsg, wParam, lParam);
-}
-
 // Start editing a cell
 void StartEditCell(int row, int col) {
-    if (g_csvData.empty() || row < 0 || col < 0) return;
+    EnterCriticalSection(&g_dataCS);
+    if (g_csvData.empty() || row < 0 || col < 0) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
 
     // Don't allow editing the row number column (column 0)
-    if (col == 0) return;
+    if (col == 0) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
 
     // Adjust column index (subtract 1 because first column is row number)
     int dataCol = col - 1;
 
     // Actual data row is row + 1 (because first row is header)
     int dataRow = row + 1;
-    if (dataRow >= (int)g_csvData.size() || dataCol >= (int)g_csvData[dataRow].size()) return;
+    if (dataRow >= (int)g_csvData.size() || dataCol >= (int)g_csvData[dataRow].size()) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
+
+    // Get cell value
+    std::string cellVal = g_csvData[dataRow][dataCol];
+    LeaveCriticalSection(&g_dataCS);
 
     // End previous edit if any
     EndEditCell(true);
@@ -1352,18 +1548,12 @@ void StartEditCell(int row, int col) {
         NULL
     );
 
-    // Subclass the edit control to handle ESC and ENTER keys
-    g_oldEditProc = (WNDPROC)SetWindowLongPtrW(g_hEdit, GWLP_WNDPROC, (LONG_PTR)EditSubclassProc);
-
     // Set font
     HFONT hFont = (HFONT)SendMessage(g_hListView, WM_GETFONT, 0, 0);
     SendMessage(g_hEdit, WM_SETFONT, (WPARAM)hFont, TRUE);
 
-    // Store original value for ESC to restore
-    g_originalCellValue = g_csvData[dataRow][dataCol];
-
     // Set text using Unicode API for proper Thai support
-    std::wstring wideText = UTF8ToWide(g_csvData[dataRow][dataCol]);
+    std::wstring wideText = UTF8ToWide(cellVal);
     SetWindowTextW(g_hEdit, wideText.c_str());
 
     // Set background color to make it more visible
@@ -1395,50 +1585,48 @@ void EndEditCell(bool save) {
         std::wstring wideText(wideBuffer);
         std::string newValue = WideToUTF8(wideText);
 
+        // Check if user explicitly typed double quotes around the input string, e.g. "myValue"
+        bool userTypedQuotes = false;
+        if (newValue.length() >= 2 && newValue.front() == '"' && newValue.back() == '"') {
+            userTypedQuotes = true;
+            newValue = newValue.substr(1, newValue.length() - 2);
+        }
+
+        EnterCriticalSection(&g_dataCS);
         // Update data - always update even if empty
         if (g_editingRow < (int)g_csvData.size() &&
             g_editingCol < (int)g_csvData[g_editingRow].size()) {
 
-            // Check if value actually changed
-            if (g_csvData[g_editingRow][g_editingCol] != newValue) {
+            bool wasQuotedOriginally = (g_editingRow < (int)g_wasQuoted.size() && g_editingCol < (int)g_wasQuoted[g_editingRow].size()) ? g_wasQuoted[g_editingRow][g_editingCol] : false;
+            bool shouldBeQuoted = userTypedQuotes || wasQuotedOriginally || IsColumnOrTableQuoted(g_editingCol, g_editingRow);
+
+            // Check if value or quote state changed
+            if (g_csvData[g_editingRow][g_editingCol] != newValue || wasQuotedOriginally != shouldBeQuoted) {
+                SaveUndoSnapshot();
                 g_csvData[g_editingRow][g_editingCol] = newValue;
+                if (g_editingRow < (int)g_wasQuoted.size() && g_editingCol < (int)g_wasQuoted[g_editingRow].size()) {
+                    g_wasQuoted[g_editingRow][g_editingCol] = shouldBeQuoted;
+                }
                 g_isModified = true;
+                
+                // Update title, UI state and refresh Virtual ListView
+                LeaveCriticalSection(&g_dataCS);
                 UpdateWindowTitle();
+                UpdateUIState();
 
-                // Update ListView display (add 1 to column for row number column)
-                // Use Unicode for proper Thai display
-                std::wstring wideDisplay = UTF8ToWide(newValue);
-                LVITEMW lviUpdate = {};
-                lviUpdate.iSubItem = g_editingCol + 1;
-                lviUpdate.pszText = (LPWSTR)wideDisplay.c_str();
-                SendMessageW(g_hListView, LVM_SETITEMTEXTW, g_editingRow - 1, (LPARAM)&lviUpdate);
-
-                // Force refresh
-                InvalidateRect(g_hListView, NULL, TRUE);
+                // Force refresh of the edited item row (g_editingRow - 1)
+                RECT rcItem;
+                ListView_GetItemRect(g_hListView, g_editingRow - 1, &rcItem, LVIR_BOUNDS);
+                InvalidateRect(g_hListView, &rcItem, TRUE);
                 UpdateWindow(g_hListView);
+            } else {
+                LeaveCriticalSection(&g_dataCS);
             }
+        } else {
+            LeaveCriticalSection(&g_dataCS);
         }
 
         delete[] wideBuffer;
-    } else {
-        // ESC pressed - restore original value
-        if (g_editingRow < (int)g_csvData.size() &&
-            g_editingCol < (int)g_csvData[g_editingRow].size()) {
-
-            // Restore original value in data (in case it was changed)
-            g_csvData[g_editingRow][g_editingCol] = g_originalCellValue;
-
-            // Update ListView display to show original value
-            std::wstring wideDisplay = UTF8ToWide(g_originalCellValue);
-            LVITEMW lviUpdate = {};
-            lviUpdate.iSubItem = g_editingCol + 1;
-            lviUpdate.pszText = (LPWSTR)wideDisplay.c_str();
-            SendMessageW(g_hListView, LVM_SETITEMTEXTW, g_editingRow - 1, (LPARAM)&lviUpdate);
-
-            // Force refresh
-            InvalidateRect(g_hListView, NULL, TRUE);
-            UpdateWindow(g_hListView);
-        }
     }
 
     // Clean up
@@ -1448,10 +1636,233 @@ void EndEditCell(bool save) {
     }
     g_editingRow = -1;
     g_editingCol = -1;
-    g_originalCellValue.clear(); // Clear the stored original value
 
     // Return focus to ListView
     if (g_hListView) {
         SetFocus(g_hListView);
     }
+}
+
+// Add a new row to the CSV data
+void AddRow() {
+    EnterCriticalSection(&g_dataCS);
+
+    // Don't allow adding if no file is currently loaded
+    if (g_currentFilePath.empty() || g_csvData.empty()) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
+
+    LeaveCriticalSection(&g_dataCS);
+    SaveUndoSnapshot();
+    EnterCriticalSection(&g_dataCS);
+
+    size_t colCount = g_csvData[0].size();
+
+    // Check if there is a selected row in the ListView
+    int selectedRow = -1;
+    if (g_hListView) {
+        selectedRow = ListView_GetNextItem(g_hListView, -1, LVNI_SELECTED);
+    }
+
+    std::vector<std::string> newRow(colCount, "");
+    std::vector<bool> newRowQuoted(colCount, false);
+
+    for (size_t c = 0; c < colCount; c++) {
+        newRowQuoted[c] = IsColumnOrTableQuoted(c);
+    }
+
+    int insertIndex;
+    if (selectedRow >= 0 && selectedRow < (int)g_csvData.size() - 1) {
+        // Insert after the currently selected row (ListView row 0 is g_csvData row 1)
+        insertIndex = selectedRow + 2;
+        if (insertIndex > (int)g_csvData.size()) {
+            insertIndex = (int)g_csvData.size();
+        }
+        g_csvData.insert(g_csvData.begin() + insertIndex, newRow);
+        g_wasQuoted.insert(g_wasQuoted.begin() + insertIndex, newRowQuoted);
+    } else {
+        // Append to the end
+        g_csvData.push_back(newRow);
+        g_wasQuoted.push_back(newRowQuoted);
+        insertIndex = (int)g_csvData.size() - 1;
+    }
+
+    g_isModified = true;
+    LeaveCriticalSection(&g_dataCS);
+
+    // Refresh display
+    if (g_csvData.size() == 2) {
+        PopulateListView();
+    } else {
+        ListView_SetItemCount(g_hListView, g_csvData.size() - 1);
+    }
+
+    UpdateWindowTitle();
+
+    // Select and scroll to newly added row in ListView
+    int lvNewRowIndex = insertIndex - 1;
+    if (g_hListView && lvNewRowIndex >= 0 && lvNewRowIndex < (int)g_csvData.size() - 1) {
+        ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(g_hListView, lvNewRowIndex, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(g_hListView, lvNewRowIndex, FALSE);
+
+        RECT rcItem;
+        ListView_GetItemRect(g_hListView, lvNewRowIndex, &rcItem, LVIR_BOUNDS);
+        InvalidateRect(g_hListView, &rcItem, TRUE);
+        UpdateWindow(g_hListView);
+
+        // Immediately start editing the first data column of the new row
+        StartEditCell(lvNewRowIndex, 1);
+    }
+}
+
+// Delete selected row from the CSV data
+void DeleteRow() {
+    EnterCriticalSection(&g_dataCS);
+
+    // Don't allow deleting if no file is currently loaded
+    if (g_currentFilePath.empty() || g_csvData.empty()) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
+
+    if (g_csvData.size() <= 1) {
+        LeaveCriticalSection(&g_dataCS);
+        MessageBox(g_hMainWindow, "No data rows available to delete!", "Notice", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    LeaveCriticalSection(&g_dataCS);
+
+    int selectedRow = -1;
+    if (g_hListView) {
+        selectedRow = ListView_GetNextItem(g_hListView, -1, LVNI_SELECTED);
+    }
+
+    if (selectedRow < 0) {
+        MessageBox(g_hMainWindow, "Please select a row to delete.", "Notice", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    SaveUndoSnapshot();
+
+    int dataRow = selectedRow + 1; // ListView row 0 corresponds to g_csvData row 1
+
+    EnterCriticalSection(&g_dataCS);
+    if (dataRow > 0 && dataRow < (int)g_csvData.size()) {
+        g_csvData.erase(g_csvData.begin() + dataRow);
+        if (dataRow < (int)g_wasQuoted.size()) {
+            g_wasQuoted.erase(g_wasQuoted.begin() + dataRow);
+        }
+        g_isModified = true;
+    }
+    size_t remainingDataRows = g_csvData.size() - 1;
+    LeaveCriticalSection(&g_dataCS);
+
+    // Update ListView count and redraw
+    ListView_SetItemCount(g_hListView, remainingDataRows);
+    InvalidateRect(g_hListView, NULL, TRUE);
+    UpdateWindow(g_hListView);
+
+    // Select adjacent row after deletion
+    if (remainingDataRows > 0) {
+        int newSel = selectedRow;
+        if (newSel >= (int)remainingDataRows) {
+            newSel = (int)remainingDataRows - 1;
+        }
+        ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_SetItemState(g_hListView, newSel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+        ListView_EnsureVisible(g_hListView, newSel, FALSE);
+    }
+
+    UpdateWindowTitle();
+    UpdateUIState();
+}
+
+// Save an undo snapshot of current state (max 10 history items)
+void SaveUndoSnapshot() {
+    EnterCriticalSection(&g_dataCS);
+    if (g_undoHistory.size() >= 10) {
+        g_undoHistory.erase(g_undoHistory.begin());
+    }
+    UndoSnapshot snap;
+    snap.csvData = g_csvData;
+    snap.wasQuoted = g_wasQuoted;
+    snap.isModified = g_isModified;
+    g_undoHistory.push_back(snap);
+    LeaveCriticalSection(&g_dataCS);
+}
+
+// Revert to previous snapshot in undo history
+void UndoAction() {
+    EnterCriticalSection(&g_dataCS);
+    if (g_undoHistory.empty()) {
+        LeaveCriticalSection(&g_dataCS);
+        return;
+    }
+
+    // Cancel edit if currently editing a cell
+    if (g_hEdit) {
+        DestroyWindow(g_hEdit);
+        g_hEdit = NULL;
+        g_editingRow = -1;
+        g_editingCol = -1;
+    }
+
+    UndoSnapshot snap = g_undoHistory.back();
+    g_undoHistory.pop_back();
+
+    g_csvData = snap.csvData;
+    g_wasQuoted = snap.wasQuoted;
+    g_isModified = snap.isModified;
+    LeaveCriticalSection(&g_dataCS);
+
+    PopulateListView();
+    UpdateWindowTitle();
+    UpdateUIState();
+}
+
+// Update UI buttons and menu items enabled/disabled state
+void UpdateUIState() {
+    EnterCriticalSection(&g_dataCS);
+    BOOL hasFile = !g_currentFilePath.empty() && !g_csvData.empty();
+    BOOL canUndo = hasFile && !g_undoHistory.empty();
+    LeaveCriticalSection(&g_dataCS);
+
+    if (g_hButtonSaveUTF8) EnableWindow(g_hButtonSaveUTF8, hasFile);
+    if (g_hButtonSaveANSI) EnableWindow(g_hButtonSaveANSI, hasFile);
+    if (g_hButtonAdd) EnableWindow(g_hButtonAdd, hasFile);
+    if (g_hButtonDelete) EnableWindow(g_hButtonDelete, hasFile);
+    if (g_hButtonUndo) EnableWindow(g_hButtonUndo, canUndo);
+
+    if (g_hMainWindow) {
+        HMENU hMenu = GetMenu(g_hMainWindow);
+        if (hMenu) {
+            UINT fileFlag = hasFile ? MF_ENABLED : (MF_DISABLED | MF_GRAYED);
+            UINT undoFlag = canUndo ? MF_ENABLED : (MF_DISABLED | MF_GRAYED);
+            EnableMenuItem(hMenu, IDM_SAVE, MF_BYCOMMAND | fileFlag);
+            EnableMenuItem(hMenu, IDM_ADD_ROW, MF_BYCOMMAND | fileFlag);
+            EnableMenuItem(hMenu, IDM_DELETE_ROW, MF_BYCOMMAND | fileFlag);
+            EnableMenuItem(hMenu, IDM_UNDO, MF_BYCOMMAND | undoFlag);
+        }
+    }
+}
+
+// Check if a column (or table) contains cells that were originally double-quoted
+bool IsColumnOrTableQuoted(size_t col, int excludeRow) {
+    // First check if this specific column has any quoted cells
+    for (size_t r = 0; r < g_wasQuoted.size(); r++) {
+        if ((int)r == excludeRow) continue;
+        if (col < g_wasQuoted[r].size() && g_wasQuoted[r][col]) {
+            return true;
+        }
+    }
+    // Fallback: check if any cell in the table is quoted
+    for (size_t r = 0; r < g_wasQuoted.size(); r++) {
+        if ((int)r == excludeRow) continue;
+        for (size_t c = 0; c < g_wasQuoted[r].size(); c++) {
+            if (g_wasQuoted[r][c]) return true;
+        }
+    }
+    return false;
 }
