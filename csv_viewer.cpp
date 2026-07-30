@@ -242,14 +242,25 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             }
             break;
 
+        case WM_LBUTTONDOWN:
+            EndEditCell(true);
+            if (g_hListView) {
+                ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
+            }
+            return 0;
+
         case WM_NOTIFY: {
             LPNMHDR pnmhdr = (LPNMHDR)lParam;
+            HWND hHeader = g_hListView ? ListView_GetHeader(g_hListView) : NULL;
             if (pnmhdr->hwndFrom == g_hListView) {
                 if (pnmhdr->code == NM_CLICK) {
                     if (g_isLoading) return 0;
                     LPNMITEMACTIVATE pnmia = (LPNMITEMACTIVATE)lParam;
-                    if (pnmia->iItem >= 0 && pnmia->iSubItem >= 0) {
+                    if (pnmia->iItem >= 0 && pnmia->iSubItem > 0) {
                         StartEditCell(pnmia->iItem, pnmia->iSubItem);
+                    } else {
+                        EndEditCell(true);
+                        ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
                     }
                     return 0;
                 } else if (pnmhdr->code == LVN_GETDISPINFOW) {
@@ -281,6 +292,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                             plvdi->item.pszText = (LPWSTR)L"";
                         }
                         LeaveCriticalSection(&g_dataCS);
+                    }
+                    return 0;
+                }
+            } else if (hHeader && pnmhdr->hwndFrom == hHeader) {
+                if (pnmhdr->code == NM_CLICK) {
+                    EndEditCell(true);
+                    if (g_hListView) {
+                        ListView_SetItemState(g_hListView, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
                     }
                     return 0;
                 }
